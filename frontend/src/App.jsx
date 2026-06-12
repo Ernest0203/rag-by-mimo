@@ -38,6 +38,9 @@ function App() {
       const res = await fetch(`${API_URL}/api/sessions`)
       const data = await res.json()
       setSessions(data)
+      if (data.length > 0 && !sessionId) {
+        loadSession(data[0].id)
+      }
     } catch (err) {
       console.error('Failed to fetch sessions:', err)
     }
