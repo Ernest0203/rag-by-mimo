@@ -8,3 +8,5 @@ chromadb
 pymupdf
 tiktoken
 python-multipart
+duckduckgo-search
+sentence-transformers

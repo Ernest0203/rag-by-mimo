@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import './App.css'
 
 const API_URL = ''
-const MODELS = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768', 'gemma2-9b-it']
+const MODELS = ['meta-llama/llama-4-scout-17b-16e-instruct', 'llama-3.3-70b-versatile', 'openai/gpt-oss-120b']
 
 function App() {
   const [messages, setMessages] = useState([])
@@ -60,7 +60,7 @@ function App() {
     try {
       const res = await fetch(`${API_URL}/api/sessions/${id}/messages`)
       const data = await res.json()
-      setMessages(data.map(m => ({ role: m.role, content: m.content, sources: m.sources || [] })))
+      setMessages(data.map(m => ({ role: m.role, content: m.content, sources: m.sources || [], grounding: m.grounding || null })))
       setSessionId(id)
     } catch (err) {
       console.error('Failed to load session:', err)
@@ -150,6 +150,7 @@ function App() {
       const decoder = new TextDecoder()
       let assistantMessage = ''
       let sources = []
+      let grounding = null
 
       setMessages(prev => [...prev, { role: 'assistant', content: '', sources: [] }])
 
@@ -171,7 +172,8 @@ function App() {
                   updated[updated.length - 1] = {
                     role: 'assistant',
                     content: assistantMessage,
-                    sources
+                    sources,
+                    grounding
                   }
                   return updated
                 })
@@ -183,7 +185,21 @@ function App() {
                   updated[updated.length - 1] = {
                     role: 'assistant',
                     content: assistantMessage,
-                    sources
+                    sources,
+                    grounding
+                  }
+                  return updated
+                })
+              }
+              if (data.grounding) {
+                grounding = data.grounding
+                setMessages(prev => {
+                  const updated = [...prev]
+                  updated[updated.length - 1] = {
+                    role: 'assistant',
+                    content: assistantMessage,
+                    sources,
+                    grounding
                   }
                   return updated
                 })
@@ -314,13 +330,24 @@ function App() {
                     <span className="typing-indicator">...</span>
                   )}
                 </div>
+                {msg.grounding && msg.role === 'assistant' && (
+                  <div className={`grounding-badge ${msg.grounding.score >= 0.7 ? 'high' : msg.grounding.score >= 0.4 ? 'medium' : 'low'}`}>
+                    <span className="grounding-score">{(msg.grounding.score * 100).toFixed(0)}% grounded</span>
+                    <span className="grounding-reason">{msg.grounding.reason}</span>
+                  </div>
+                )}
                 {msg.sources && msg.sources.length > 0 && (
                   <div className="sources">
                     <div className="sources-label">Источники:</div>
                     {msg.sources.map((src, j) => (
                       <div key={j} className="source-item">
-                        <span className="source-filename">{src.filename}</span>
-                        <span className="source-excerpt">{src.excerpt}...</span>
+                        {src.url ? (
+                          <a href={src.url} target="_blank" rel="noopener noreferrer" className="source-filename">{src.excerpt}</a>
+                        ) : (
+                          <span className="source-filename">{src.filename}</span>
+                        )}
+                        {src.url && <span className="source-url">{src.url}</span>}
+                        {!src.url && <span className="source-excerpt">{src.excerpt}...</span>}
                       </div>
                     ))}
                   </div>

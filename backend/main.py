@@ -13,6 +13,8 @@ import aiosqlite
 import chromadb
 import tiktoken
 import fitz
+from duckduckgo_search import DDGS
+import chromadb.utils.embedding_functions as ef
 
 load_dotenv()
 
@@ -31,7 +33,7 @@ client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1"
 )
 
-SUPPORTED_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"]
+SUPPORTED_MODELS = ["meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.3-70b-versatile", "openai/gpt-oss-120b"]
 DB_PATH = "chat.db"
 UPLOAD_DIR = "uploads"
 
@@ -43,6 +45,19 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
+multilingual_ef = ef.SentenceTransformerEmbeddingFunction(
+    model_name="paraphrase-multilingual-MiniLM-L12-v2"
+)
+
+_cross_encoder_model = None
+
+def get_cross_encoder():
+    global _cross_encoder_model
+    if _cross_encoder_model is None:
+        from sentence_transformers import CrossEncoder
+        _cross_encoder_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return _cross_encoder_model
+
 
 class Message(BaseModel):
     role: str
@@ -51,7 +66,7 @@ class Message(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: List[Message]
-    model: str = "llama-3.3-70b-versatile"
+    model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
     session_id: Optional[str] = None
 
 
@@ -88,6 +103,7 @@ async def init_db():
                 model TEXT NOT NULL,
                 title TEXT DEFAULT '',
                 sources TEXT DEFAULT '[]',
+                grounding REAL DEFAULT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -101,48 +117,143 @@ async def init_db():
         """)
         await db.commit()
 
+        cursor = await db.execute("PRAGMA table_info(messages)")
+        columns = [row[1] for row in await cursor.fetchall()]
+        if "grounding" not in columns:
+            await db.execute("ALTER TABLE messages ADD COLUMN grounding REAL DEFAULT NULL")
+            await db.commit()
+
 
 @app.on_event("startup")
 async def startup():
     await init_db()
 
 
-async def save_message(session_id: str, role: str, content: str, model: str, title: str = "", sources: str = "[]"):
+async def save_message(session_id: str, role: str, content: str, model: str, title: str = "", sources: str = "[]", grounding: float = None):
     async with aiosqlite.connect(DB_PATH) as db:
         if title:
             await db.execute(
-                "INSERT INTO messages (session_id, role, content, model, title, sources) VALUES (?, ?, ?, ?, ?, ?)",
-                (session_id, role, content, model, title, sources)
+                "INSERT INTO messages (session_id, role, content, model, title, sources, grounding) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (session_id, role, content, model, title, sources, grounding)
             )
         else:
             await db.execute(
-                "INSERT INTO messages (session_id, role, content, model, sources) VALUES (?, ?, ?, ?, ?)",
-                (session_id, role, content, model, sources)
+                "INSERT INTO messages (session_id, role, content, model, sources, grounding) VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, role, content, model, sources, grounding)
             )
         await db.commit()
 
 
 def retrieve_chunks(session_id: str, query: str, top_k: int = 3):
     try:
-        collection = chroma_client.get_or_create_collection(name=f"docs_{session_id}")
-        print(f"DEBUG RETRIEVE: collection={collection.name}, count={collection.count()}")
+        collection = chroma_client.get_or_create_collection(
+            name=f"docs_{session_id}",
+            embedding_function=multilingual_ef
+        )
         if collection.count() == 0:
             return None, []
-        results = collection.query(query_texts=[query], n_results=top_k)
-        print(f"DEBUG RETRIEVE: results={results}")
-        if results and results["documents"] and results["documents"][0]:
-            chunks = results["documents"][0]
-            metadatas = results["metadatas"][0] if results["metadatas"] else [{}] * len(chunks)
-            sources = []
-            for chunk, meta in zip(chunks, metadatas):
-                sources.append({
-                    "filename": meta.get("filename", "unknown"),
-                    "excerpt": chunk[:200]
-                })
-            context = "\n\n---\n\n".join(chunks)
-            return context, sources
+
+        initial_k = min(10, collection.count())
+        results = collection.query(query_texts=[query], n_results=initial_k)
+        if not results or not results["documents"] or not results["documents"][0]:
+            return None, []
+
+        chunks = results["documents"][0]
+        metadatas = results["metadatas"][0] if results["metadatas"] else [{}] * len(chunks)
+
+        if len(chunks) > top_k:
+            cross_encoder = get_cross_encoder()
+            pairs = [(query, chunk) for chunk in chunks]
+            scores = cross_encoder.predict(pairs)
+            ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+            top_indices = ranked_indices[:top_k]
+            chunks = [chunks[i] for i in top_indices]
+            metadatas = [metadatas[i] for i in top_indices]
+
+        sources = []
+        for chunk, meta in zip(chunks, metadatas):
+            sources.append({
+                "filename": meta.get("filename", "unknown"),
+                "excerpt": chunk[:200]
+            })
+        context = "\n\n---\n\n".join(chunks)
+        return context, sources
     except Exception as e:
-        print(f"DEBUG RETRIEVE ERROR: {e}")
+        print(f"RETRIEVE ERROR: {e}")
+    return None, []
+
+
+async def check_grounding(context: str, answer: str) -> dict:
+    try:
+        prompt = (
+            f"Given context: {context}\nAnswer: {answer}\n"
+            "Rate how much the answer is grounded in the context: "
+            "0.0 (pure hallucination) to 1.0 (fully grounded). "
+            "Respond with JSON: {\"score\": float, \"reason\": string}"
+        )
+        response = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=200,
+        )
+        text = response.choices[0].message.content.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        return json.loads(text)
+    except Exception as e:
+        print(f"GROUNDING CHECK ERROR: {e}")
+        return {"score": 0.0, "reason": f"Grounding check failed: {e}"}
+
+
+def needs_doc_context(query: str) -> bool:
+    keywords = [
+        "документ", "файл", "текст", "содержание", "содержимое",
+        "прочитай", "прочти", "найди в документе", "что в файле",
+        "what does the document", "what's in the file", "summarize",
+        "проанализируй", "про файл", "в файле", "в документе",
+        "по документу", "из документа", "из файла"
+    ]
+    query_lower = query.lower()
+    return any(kw in query_lower for kw in keywords)
+
+
+def needs_web_search(query: str) -> bool:
+    keywords = [
+        "погод", "weather", "новост", "news", "курс", "price", "цена",
+        "сегодня", "today", "сейчас", "now", "актуальн", "latest",
+        "что происходит", "what's happening", "спорт", "football", "soccer",
+        "футбол", "хоккей", "hockey", "олимпиад", "election", "выбор",
+        "stock", "bitcoin", "криптовалют", "нефть", "oil",
+        "доллар", "dollar", "евро", "euro", "рубль", "ruble",
+        "завтра", "tomorrow", "вчера", "yesterday"
+    ]
+    query_lower = query.lower()
+    return any(kw in query_lower for kw in keywords)
+
+
+def web_search(query: str, max_results: int = 3):
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+            print(f"DEBUG WEB SEARCH: query='{query}', results_count={len(results)}")
+            for r in results:
+                print(f"  - {r.get('title', '')} | {r.get('href', '')}")
+            if results:
+                snippets = []
+                sources = []
+                for r in results:
+                    snippet = f"{r.get('title', '')}\n{r.get('body', '')}"
+                    snippets.append(snippet)
+                    sources.append({
+                        "filename": "web",
+                        "excerpt": r.get('title', ''),
+                        "url": r.get('href', '')
+                    })
+                context = "\n\n---\n\n".join(snippets)
+                return context, sources
+    except Exception as e:
+        print(f"WEB SEARCH ERROR: {e}")
     return None, []
 
 
@@ -169,7 +280,10 @@ async def upload_file(session_id: str, file: UploadFile = File(...)):
     chunks = chunk_text(text)
     print(f"DEBUG UPLOAD: text_len={len(text)}, chunks={len(chunks)}")
 
-    collection = chroma_client.get_or_create_collection(name=f"docs_{session_id}")
+    collection = chroma_client.get_or_create_collection(
+        name=f"docs_{session_id}",
+        embedding_function=multilingual_ef
+    )
     ids = [f"{file_id}_{i}" for i in range(len(chunks))]
     metadatas = [{"filename": file.filename, "doc_id": file_id}] * len(chunks)
 
@@ -208,7 +322,10 @@ async def delete_document(doc_id: str):
         filename = row["filename"]
 
         try:
-            collection = chroma_client.get_collection(name=f"docs_{session_id}")
+            collection = chroma_client.get_collection(
+                name=f"docs_{session_id}",
+                embedding_function=multilingual_ef
+            )
             collection.delete(where={"doc_id": doc_id})
         except Exception:
             pass
@@ -230,13 +347,35 @@ async def chat(request: ChatRequest):
 
     session_id = request.session_id or str(datetime.now().timestamp())
 
-    context, sources = retrieve_chunks(session_id, request.messages[-1].content) if request.messages else (None, [])
-    print(f"DEBUG CHAT: session_id={session_id}, context_len={len(context) if context else 0}, sources={len(sources)}")
+    doc_context, doc_sources = (None, [])
+    if request.messages and needs_doc_context(request.messages[-1].content):
+        doc_context, doc_sources = retrieve_chunks(session_id, request.messages[-1].content)
 
-    system_msg = {"role": "system", "content": "You are a helpful assistant. Answer based on the provided context if relevant."}
-    if context:
-        system_msg["content"] = f"Answer based on the following context:\n\n{context}\n\n---\n\nIf the context doesn't contain relevant information, answer from your general knowledge."
+    web_context, web_sources = (None, [])
+    if request.messages and needs_web_search(request.messages[-1].content):
+        search_query = request.messages[-1].content + " актуальный 2025"
+        web_context, web_sources = web_search(search_query)
 
+    all_sources = (doc_sources or []) + (web_sources or [])
+
+    system_prompt = (
+        "You are a helpful assistant with access to two sources of information:\n"
+        "1. Documents uploaded by the user\n"
+        "2. Real-time web search results\n\n"
+        "RULES:\n"
+        "- If web search results are provided, ALWAYS use them to answer questions about current events, "
+        "weather, news, prices, sports scores, or any time-sensitive information.\n"
+        "- If document context is provided, use it to answer questions about the user's files.\n"
+        "- Combine both sources when relevant.\n"
+        "- Never say you don't have access to the internet if web search results are shown below.\n"
+        "- Answer in the same language the user writes in."
+    )
+    if doc_context:
+        system_prompt += f"\n\n--- Documents ---\n{doc_context}\n---"
+    if web_context:
+        system_prompt += f"\n\n--- Web Search Results ---\n{web_context}\n---"
+
+    system_msg = {"role": "system", "content": system_prompt}
     messages_for_api = [system_msg] + [{"role": m.role, "content": m.content} for m in request.messages]
 
     if request.messages:
@@ -247,7 +386,7 @@ async def chat(request: ChatRequest):
                 title = last_user.content[:80]
             await save_message(session_id, "user", last_user.content, request.model, title)
 
-    sources_json = json.dumps(sources)
+    sources_json = json.dumps(all_sources)
 
     async def generate():
         full_response = ""
@@ -267,9 +406,15 @@ async def chat(request: ChatRequest):
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
             return
 
-        await save_message(session_id, "assistant", full_response, request.model, "", sources_json)
+        grounding = None
+        if doc_context and full_response:
+            grounding_result = await check_grounding(doc_context, full_response)
+            grounding = grounding_result.get("score")
+            yield f"data: {json.dumps({'grounding': grounding_result})}\n\n"
 
-        yield f"data: {json.dumps({'sources': sources, 'done': True, 'session_id': session_id})}\n\n"
+        await save_message(session_id, "assistant", full_response, request.model, "", sources_json, grounding)
+
+        yield f"data: {json.dumps({'sources': all_sources, 'done': True, 'session_id': session_id})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -302,7 +447,7 @@ async def get_session_messages(session_id: str):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT role, content, model, sources, created_at FROM messages WHERE session_id = ? ORDER BY created_at",
+            "SELECT role, content, model, sources, grounding, created_at FROM messages WHERE session_id = ? ORDER BY created_at",
             (session_id,)
         )
         rows = await cursor.fetchall()
@@ -312,6 +457,7 @@ async def get_session_messages(session_id: str):
                 "content": row["content"],
                 "model": row["model"],
                 "sources": json.loads(row["sources"]) if row["sources"] else [],
+                "grounding": row["grounding"],
                 "created_at": row["created_at"]
             }
             for row in rows
