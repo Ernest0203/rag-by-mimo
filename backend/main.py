@@ -144,12 +144,36 @@ async def save_message(session_id: str, role: str, content: str, model: str, tit
         await db.commit()
 
 
-def retrieve_chunks(session_id: str, query: str, top_k: int = 3):
+def _get_or_create_collection(session_id: str):
+    name = f"docs_{session_id}"
     try:
-        collection = chroma_client.get_or_create_collection(
-            name=f"docs_{session_id}",
+        return chroma_client.get_or_create_collection(
+            name=name,
             embedding_function=multilingual_ef
         )
+    except ValueError:
+        print(f"EF CONFLICT: deleting old collection '{name}' and recreating with multilingual embeddings")
+        try:
+            chroma_client.delete_collection(name=name)
+        except Exception:
+            pass
+        return chroma_client.get_or_create_collection(
+            name=name,
+            embedding_function=multilingual_ef
+        )
+
+
+def has_documents(session_id: str) -> bool:
+    try:
+        collection = _get_or_create_collection(session_id)
+        return collection.count() > 0
+    except Exception:
+        return False
+
+
+def retrieve_chunks(session_id: str, query: str, top_k: int = 3):
+    try:
+        collection = _get_or_create_collection(session_id)
         if collection.count() == 0:
             return None, []
 
@@ -280,10 +304,7 @@ async def upload_file(session_id: str, file: UploadFile = File(...)):
     chunks = chunk_text(text)
     print(f"DEBUG UPLOAD: text_len={len(text)}, chunks={len(chunks)}")
 
-    collection = chroma_client.get_or_create_collection(
-        name=f"docs_{session_id}",
-        embedding_function=multilingual_ef
-    )
+    collection = _get_or_create_collection(session_id)
     ids = [f"{file_id}_{i}" for i in range(len(chunks))]
     metadatas = [{"filename": file.filename, "doc_id": file_id}] * len(chunks)
 
@@ -322,10 +343,7 @@ async def delete_document(doc_id: str):
         filename = row["filename"]
 
         try:
-            collection = chroma_client.get_collection(
-                name=f"docs_{session_id}",
-                embedding_function=multilingual_ef
-            )
+            collection = _get_or_create_collection(session_id)
             collection.delete(where={"doc_id": doc_id})
         except Exception:
             pass
@@ -348,7 +366,7 @@ async def chat(request: ChatRequest):
     session_id = request.session_id or str(datetime.now().timestamp())
 
     doc_context, doc_sources = (None, [])
-    if request.messages and needs_doc_context(request.messages[-1].content):
+    if request.messages and has_documents(session_id):
         doc_context, doc_sources = retrieve_chunks(session_id, request.messages[-1].content)
 
     web_context, web_sources = (None, [])
